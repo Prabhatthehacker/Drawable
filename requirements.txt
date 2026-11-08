@@ -1,0 +1,8 @@
+pyautogui
+pygetwindow
+opencv-python
+numpy
+pillow
+diffusers
+transformers
+accelerate
