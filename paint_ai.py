@@ -1,7 +1,7 @@
 """Drawable - local AI that draws (and colors) pictures in MS Paint by controlling the mouse.
 
 Made for Windows 10 Paint (maximized). Everything runs on your PC.
-Stop at any time: press ESC, move the mouse yourself, or fling it into a screen corner.
+Give control with the green button. Take it back any time: click the red bar, press ESC, or move the mouse.
 """
 import os, sys, threading, time
 import tkinter as tk
@@ -22,6 +22,15 @@ MODEL = "stabilityai/sd-turbo"
 VIDEO_DIR = r"C:\Users\DELL\OneDrive\Desktop\Drawing Videos"
 pipe = None
 stop_flag = False
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class GenStopped(Exception):
+    pass
+
+
+ui_hooks = {}
+
 
 # ---------------------------------------------------------------- Paint layout
 # Windows 10 Paint, maximized (screen coordinates, taken from a real screenshot).
@@ -68,6 +77,8 @@ def generate_image(prompt, status):
     args = dict(num_inference_steps=4, guidance_scale=0.0, height=512, width=512)
 
     def cb(_pipe, step, _t, kwargs):
+        if stop_flag or esc_pressed():
+            raise GenStopped()
         status(f"Generating image... step {step + 1}/4 (CPU can take a minute or two)")
         return kwargs
 
@@ -329,6 +340,10 @@ class Driver:
             return self._stop("you pressed Take Back Control")
         if esc_pressed():
             return self._stop("you pressed ESC")
+        if self.last is not None:
+            p = pyautogui.position()
+            if abs(p.x - self.last[0]) > 4 or abs(p.y - self.last[1]) > 4:
+                return self._stop("you moved the mouse")
         pyautogui.moveTo(x, y)
         self.last = (x, y)
         time.sleep(self.delay)
@@ -542,12 +557,36 @@ def draw_plan(plan, L, cols, status, delay=0.004):
 
 
 # ---------------------------------------------------------------- the app
+def request_stop():
+    global stop_flag
+    stop_flag = True
+
+
 def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record, timelapse, status, done, ui):
     global stop_flag
     stop_flag = False
-    minimized = False
     try:
-        img = load_image(image_path) if image_path else generate_image(prompt, status)
+        ui(lambda: ui_hooks["compact"](True))    # control given: this window becomes the Take Back Control bar
+        time.sleep(0.4)
+
+        # A typed prompt ALWAYS wins: the AI imagines the picture from scratch.
+        # An uploaded image is used only when the prompt box is empty.
+        if prompt:
+            if image_path:
+                status("Using your prompt and ignoring the uploaded image...")
+                time.sleep(1.0)
+            status(f'Imagining "{prompt}" from scratch... (CPU can take a few minutes)')
+            img = generate_image(prompt, status)
+            try:
+                img.save(os.path.join(SCRIPT_DIR, "last_imagined.png"))
+            except Exception:
+                pass
+        else:
+            status("Loading your uploaded image...")
+            img = load_image(image_path)
+        if stop_flag:
+            status("Stopped.")
+            return
 
         status("Looking for Paint window...")
         win = find_paint()
@@ -560,14 +599,6 @@ def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record,
             status("Stopped.")
             return
 
-        status("Requesting control...")
-        if not ask_control(ui):
-            status("Control denied. Nothing was drawn.")
-            return
-
-        ui(lambda: root.iconify())           # get out of the way: it would cover the canvas
-        minimized = True
-        time.sleep(0.8)
         try:
             if win.isMinimized:
                 win.restore()
@@ -590,7 +621,7 @@ def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record,
         plan = build_plan(img, cols, box, detail, do_fill, do_outline, keep_bg)
         n = sum(len(r) for _, r in plan["fills"]) + len(plan["outlines"]) + len(plan["outline_runs"])
         mins = n * (5 * SPEED.get(speed, 0.004) + 0.012) / 60
-        status(f"Drawing {n} strokes (about {max(1, round(mins))} min). ESC stops it.")
+        status(f"Drawing {n} strokes (about {max(1, round(mins))} min).")
         rec = None
         if record:
             ox, oy = plan["origin"]
@@ -606,7 +637,7 @@ def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record,
         finally:
             video = rec.stop() if rec else None
         if dr.stopped:
-            msg = f"Stopped because {dr.reason}."
+            msg = f"Control given back because {dr.reason}."
         elif dr.warn:
             msg = "Done! (Paint's color box could not be confirmed - check the colors.)"
         else:
@@ -614,6 +645,8 @@ def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record,
         if video:
             msg += f" Video saved: {video}"
         status(msg)
+    except GenStopped:
+        status("Control given back before drawing started.")
     except pyautogui.FailSafeException:
         status("Emergency stop (mouse hit a screen corner).")
     except Exception as e:
@@ -623,46 +656,60 @@ def run(prompt, image_path, detail, speed, do_fill, do_outline, keep_bg, record,
             pyautogui.mouseUp()
         except Exception:
             pass
-        if minimized:
-            ui(lambda: (root.deiconify(), root.attributes("-topmost", True)))
+        ui(lambda: ui_hooks["compact"](False))
         done()
-
-
-def ask_control(ui):
-    ev = threading.Event()
-    res = {"ok": False}
-
-    def show():
-        res["ok"] = messagebox.askyesno(
-            "Control request",
-            "Drawable wants to control your mouse to draw in Paint.\n\n"
-            "This window will minimize while it draws.\n"
-            "To take back control: press ESC, or just move the mouse.\n\n"
-            "Grant control?",
-            parent=root)
-        ev.set()
-
-    ui(show)
-    ev.wait()
-    return res["ok"]
 
 
 def main():
     global root
     root = tk.Tk()
     root.title("Drawable")
-    W, H = 480, 380
-    root.geometry(f"{W}x{H}+{root.winfo_screenwidth() - W - 10}+{root.winfo_screenheight() - H - 60}")
+    W, H = 480, 330
+    home_geo = f"{W}x{H}+{root.winfo_screenwidth() - W - 10}+{root.winfo_screenheight() - H - 60}"
+    root.geometry(home_geo)
     root.attributes("-topmost", True)
     img_path = tk.StringVar()
 
     def ui(fn):
         root.after(0, fn)
 
-    tk.Label(root, text="Prompt (e.g. 'a cat sitting on a moon')").pack(pady=(10, 0))
-    prompt_entry = tk.Entry(root, width=48)
+    body = tk.Frame(root)
+    body.pack(fill="both", expand=True)
+
+    # the small bar this same window turns into while it has control
+    bar = tk.Frame(root, bg="#222222")
+    bar_label = tk.Label(bar, text="", bg="#222222", fg="white", font=("Segoe UI", 9), wraplength=340)
+    bar_label.pack(fill="x", pady=(3, 0))
+    bar_btn = tk.Button(bar, bg="#d9534f", fg="white", activebackground="#b52b27", activeforeground="white",
+                        font=("Segoe UI", 9, "bold"))
+    bar_btn.pack(fill="x", padx=4, pady=4)
+
+    def bar_click():
+        request_stop()
+        bar_btn.config(text="Control given back...", state="disabled")
+
+    bar_btn.config(command=bar_click)
+
+    def set_compact(on):
+        if on:
+            body.pack_forget()
+            bar_btn.config(text="TAKE BACK CONTROL  (or ESC / move the mouse)", state="normal")
+            bar_label.config(text="Control given. Starting...")
+            bar.pack(fill="both", expand=True)
+            cw = 360
+            root.geometry(f"{cw}x70+{root.winfo_screenwidth() - cw - 4}+0")
+        else:
+            bar.pack_forget()
+            body.pack(fill="both", expand=True)
+            root.geometry(home_geo)
+            root.attributes("-topmost", True)
+
+    ui_hooks["compact"] = set_compact
+
+    tk.Label(body, text="Prompt (e.g. 'a cat sitting on a moon')").pack(pady=(10, 0))
+    prompt_entry = tk.Entry(body, width=48)
     prompt_entry.pack(pady=4)
-    path_label = tk.Label(root, text="No image uploaded", fg="gray")
+    path_label = tk.Label(body, text="No image uploaded", fg="gray")
     path_label.pack()
 
     def upload():
@@ -675,12 +722,12 @@ def main():
         img_path.set("")
         path_label.config(text="No image uploaded")
 
-    row = tk.Frame(root)
+    row = tk.Frame(body)
     row.pack(pady=4)
     tk.Button(row, text="Upload Image", command=upload).pack(side="left", padx=4)
     tk.Button(row, text="Clear", command=clear_upload).pack(side="left", padx=4)
 
-    opts = tk.Frame(root)
+    opts = tk.Frame(body)
     opts.pack(pady=2)
     fill_var, line_var, detail_var = tk.BooleanVar(value=True), tk.BooleanVar(value=True), tk.StringVar(value="Normal")
     tk.Checkbutton(opts, text="Fill colors", variable=fill_var).pack(side="left", padx=4)
@@ -693,20 +740,25 @@ def main():
     tk.Label(opts, text="Speed:").pack(side="left", padx=(8, 0))
     ttk.Combobox(opts, textvariable=speed_var, values=list(SPEED), width=7, state="readonly").pack(side="left")
 
-    rec_row = tk.Frame(root)
+    rec_row = tk.Frame(body)
     rec_row.pack(pady=2)
     rec_var, lapse_var = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
     tk.Checkbutton(rec_row, text="Record video of the drawing", variable=rec_var).pack(side="left", padx=4)
     tk.Checkbutton(rec_row, text="Fast-forward (time-lapse)", variable=lapse_var).pack(side="left", padx=4)
 
-    status_label = tk.Label(root, text="Ready. In Paint: open a blank canvas, maximize it.", fg="blue", wraplength=370)
+    status_label = tk.Label(body, text="Ready. In Paint: open a blank canvas, maximize it.", fg="blue", wraplength=440)
     status_label.pack(pady=6)
 
-    go_btn = tk.Button(root, text="Draw in Paint", width=22, bg="#4CAF50", fg="white")
+    go_btn = tk.Button(body, text="Give Control & Draw", width=24, bg="#4CAF50", fg="white")
     go_btn.pack()
+    tk.Label(body, text="Control ends when you click Take Back Control, press ESC, or move the mouse.",
+             fg="gray").pack(pady=6)
 
     def set_status(t):
-        root.after(0, lambda: status_label.config(text=t))
+        def f():
+            status_label.config(text=t)
+            bar_label.config(text=t[:95])
+        root.after(0, f)
 
     def finished():
         root.after(0, lambda: go_btn.config(state="normal"))
@@ -724,13 +776,7 @@ def main():
                          args=(p, ip, detail_var.get(), speed_var.get(), fill_var.get(), line_var.get(), bg_var.get(), rec_var.get(), lapse_var.get(),
                                set_status, finished, ui)).start()
 
-    def take_back():
-        global stop_flag
-        stop_flag = True
-
     go_btn.config(command=start)
-    tk.Button(root, text="Take Back Control", bg="#d9534f", fg="white", width=22, command=take_back).pack(pady=6)
-    tk.Label(root, text="While drawing: press ESC or move the mouse to stop.", fg="gray").pack()
     root.mainloop()
 
 
