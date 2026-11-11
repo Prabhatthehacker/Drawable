@@ -1,0 +1,78 @@
+name: Build Drawable (Windows app)
+
+# Run it by hand: GitHub repo -> Actions tab -> "Build Drawable (Windows app)" -> Run workflow.
+# When it finishes, the app is on the repo's Releases page as Drawable-Windows.zip.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libraries
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build the app
+        shell: pwsh
+        run: |
+          pyinstaller paint_ai.py --noconfirm --clean --windowed --name Drawable `
+            --collect-submodules diffusers `
+            --collect-submodules transformers `
+            --collect-data diffusers `
+            --collect-data transformers `
+            --recursive-copy-metadata diffusers `
+            --recursive-copy-metadata transformers `
+            --recursive-copy-metadata huggingface_hub `
+            --recursive-copy-metadata tokenizers `
+            --recursive-copy-metadata safetensors `
+            --recursive-copy-metadata numpy `
+            --recursive-copy-metadata tqdm `
+            --recursive-copy-metadata requests `
+            --recursive-copy-metadata packaging `
+            --recursive-copy-metadata filelock `
+            --recursive-copy-metadata regex `
+            --recursive-copy-metadata pyyaml `
+            --recursive-copy-metadata accelerate `
+            --copy-metadata torch
+
+      - name: Check the app starts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/Drawable/Drawable.exe)) { throw "Drawable.exe was not built" }
+          $p = Start-Process dist/Drawable/Drawable.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { throw "Drawable.exe closed by itself (exit code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "Drawable.exe started and stayed open."
+
+      - name: Zip it
+        shell: pwsh
+        run: |
+          Copy-Item README-APP.txt dist/Drawable/README.txt -ErrorAction SilentlyContinue
+          7z a -tzip -mx=5 Drawable-Windows.zip ./dist/Drawable
+          (Get-Item Drawable-Windows.zip).Length / 1MB
+
+      - name: Publish to Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "build-${{ github.run_number }}" }
+          gh release create $tag Drawable-Windows.zip --title "Drawable $tag" --notes "Unzip, open the Drawable folder, double-click Drawable.exe."
