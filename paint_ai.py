@@ -9,6 +9,7 @@ import math
 import multiprocessing
 import os
 import queue
+import re
 import shutil
 import sys
 import tempfile
@@ -31,7 +32,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 MODEL = "stabilityai/sd-turbo"
-STYLE = ", colorful cartoon illustration, flat colors, bold clean outlines"
+STYLE = "colorful storybook illustration, clean smooth shapes, flat colors, simple clean outlines, "
 DETAIL = {"Fast": 360, "Normal": 520, "Detailed": 720}          # longest side of the canvas, in pixels
 SPEED = {"Slow": 120, "Normal": 45, "Fast": 15, "Instant": 0}   # seconds the drawing takes
 FPS = 24
@@ -115,9 +116,65 @@ def get_pipe(status):
     return pipe
 
 
+_META = re.compile(r"palette|colou?r|instruction|quality|composition|requirement|final|sequence|order|rules?", re.I)
+_VERBS = re.compile(r"^(?:\d+[.)]\s*)?(?:draw|create|add|include|make|show|place|put|position|give|use|keep|ensure|surround|"
+                    r"maintain|finish|fill|follow|let|have)\s+(?:a|an|the|some|several|beautiful|breathtaking)?\s*", re.I)
+
+
+def clean_prompt(text):
+    """Turns a long, written-out brief into the short list of things to picture (the model only reads the start)."""
+    parts, skip, title_done = [], False, False
+    for raw in text.replace("\r", "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            head = line.lstrip("#").strip()
+            skip = bool(_META.search(head))
+            if not title_done and not parts and re.search(r"prompt|drawing", head, re.I):
+                title_done = True
+                skip = False
+                continue
+            continue
+        if skip:
+            continue
+        line = re.sub(r"^[-*\u2022]+\s*|^\d+[.)]\s*", "", line)
+        line = line.replace("**", "").strip()
+        if re.search(r"\b(exactly|do not|don't|avoid|must|should)\b", line, re.I):
+            continue
+        line = _VERBS.sub("", line).strip(" .")
+        if line:
+            parts.append(line)
+    out = ", ".join(parts) if parts else text
+    out = re.sub(r"\b(breathtaking|beautiful|charming|adorable|cosy|magical|especially|naturally|important|really|very)\b,?\s*", "", out, flags=re.I)
+    out = re.sub(r"[^,]*\bpart of the drawing\b[^,]*,?\s*", "", out, flags=re.I)
+    return re.sub(r"\s+", " ", out).replace(" ,", ",").replace(":,", ":")
+
+
+def wanted_colors(text):
+    """If the prompt says 'exactly 25 colours', return 25."""
+    m = re.search(r"exactly\s+(\d+)\s+colou?rs?", text, re.I)
+    return max(6, min(32, int(m.group(1)))) if m else None
+
+
+def encode_long(p, text, max_chunks=4):
+    """Lets the model read more than 77 words-pieces by reading the prompt in several pieces."""
+    import torch
+    tok, enc = p.tokenizer, p.text_encoder
+    ids = tok(text, add_special_tokens=False).input_ids
+    chunks = [ids[i:i + 75] for i in range(0, len(ids), 75)][:max_chunks] or [[]]
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    embs = []
+    for ch in chunks:
+        full = [tok.bos_token_id] + ch + [tok.eos_token_id] + [pad] * (75 - len(ch))
+        with torch.no_grad():
+            embs.append(enc(torch.tensor([full], device=enc.device))[0])
+    return torch.cat(embs, dim=1).to(p.unet.dtype)
+
+
 def generate_image(prompt, status):
     p = get_pipe(status)
-    text = prompt + STYLE
+    text = STYLE + clean_prompt(prompt)
     args = dict(num_inference_steps=4, guidance_scale=0.0, height=512, width=512)
 
     def cb(_pipe, step, _t, kwargs):
@@ -128,8 +185,18 @@ def generate_image(prompt, status):
 
     status("Imagining your picture... (a CPU can take a minute or two)")
     try:
+        emb = encode_long(p, text)
+    except Exception:
+        emb = None                                              # fall back to the normal short prompt
+    try:
+        if emb is not None:
+            return p(prompt_embeds=emb, callback_on_step_end=cb, **args).images[0]
         return p(text, callback_on_step_end=cb, **args).images[0]
-    except TypeError:
+    except Stopped:
+        raise
+    except Exception:
+        if emb is not None:                                     # long-prompt route failed: use the short one
+            return p(text, **args).images[0]
         return p(text, **args).images[0]
 
 
@@ -156,22 +223,31 @@ def runs_from_mask(mask):
 
 
 def find_lines(rgb):
-    """The picture's own dark outlines (cartoons, coloring pages) or, for photos, its edges."""
+    """The picture's own dark outlines (cartoons, coloring pages) or, for painted pictures, only its strongest edges."""
     h, w = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     dark = (gray < 100) & (rgb.max(axis=2) < 110)       # dark in every channel, so red or brown never count
+    # Real outlines are thin. Big dark areas (shadows, dark leaves) are shading, not outlines: the color fill handles them.
+    k = max(3, int(round(max(h, w) / 90)) | 1)
+    blobs = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    dark = dark & ~(cv2.dilate(blobs, np.ones((3, 3), np.uint8)) > 0)
     frac = float(dark.mean())
     mode = "lines"
-    if frac < 0.004 or frac > 0.35:
+    if frac < 0.004 or frac > 0.2:
         mode = "edges"
-        dark = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 60, 150) > 0
+        sm = cv2.pyrMeanShiftFiltering(cv2.bilateralFilter(rgb, 9, 40, 7), 8, 20)   # smooth away painted texture
+        g = cv2.GaussianBlur(cv2.cvtColor(sm, cv2.COLOR_RGB2GRAY), (5, 5), 0)
+        for hi in range(40, 400, 10):                   # raise the threshold until only the strongest ~5% remain
+            dark = cv2.Canny(g, hi * 0.4, hi) > 0
+            if dark.mean() <= 0.05:
+                break
         dark[:4, :] = False
         dark[-4:, :] = False
         dark[:, :4] = False
         dark[:, -4:] = False
     num, cc, stats, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), connectivity=8)
     keep = np.zeros(num, bool)
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(5 if mode == "lines" else 8, (h * w) // 50000)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= (max(5, (h * w) // 50000) if mode == "lines" else max(25, (h * w) // 11000))
     return keep[cc], mode
 
 
@@ -619,6 +695,7 @@ class App:
         self.swatches = []
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.report_callback_exception = self.on_ui_error        # a mistake inside a button never leaves the app stuck
         root.after(80, self.poll)
 
     # ---- layout
@@ -637,10 +714,9 @@ class App:
         tk.Label(left, text="Describe a picture. It will draw it for you.", fg="#555").pack(anchor="w", pady=(0, 10))
 
         ttk.Label(left, text="What should it draw?").pack(anchor="w")
-        self.prompt = tk.StringVar()
-        entry = ttk.Entry(left, textvariable=self.prompt, width=44)
-        entry.pack(fill="x", pady=(2, 6))
-        entry.bind("<Return>", lambda e: self.on_create())
+        self.prompt = tk.Text(left, width=44, height=6, wrap="word", font=("Segoe UI", 10), undo=True)
+        self.prompt.pack(fill="x", pady=(2, 6))
+        self.prompt.bind("<Control-Return>", lambda e: (self.on_create(), "break")[1])
         self.create_btn = tk.Button(left, text="Create & draw", bg="#2e9e57", fg="white", font=("Segoe UI", 11, "bold"),
                                     command=self.on_create)
         self.create_btn.pack(fill="x", ipady=4)
@@ -758,7 +834,7 @@ class App:
     def on_create(self):
         if self.create_btn["state"] == "disabled":
             return
-        prompt = self.prompt.get().strip()
+        prompt = self.prompt.get("1.0", "end").strip()
         if not prompt and not self.image_path:
             self.set_status("Type what you want drawn, or choose your own picture.")
             return
@@ -782,6 +858,10 @@ class App:
         say = lambda t: self.q.put(("status", t))
         try:
             if prompt:
+                n = wanted_colors(prompt)
+                if n:
+                    o["colors"] = n
+                    say(f"Your prompt asks for {n} colors - using that.")
                 img = generate_image(prompt, say)
             else:
                 say("Loading your picture...")
@@ -797,69 +877,117 @@ class App:
             self.q.put(("error", f"{type(e).__name__}: {e}"))
 
     def poll(self):
+        """Handles messages from the background threads. One bad message can never stop this loop."""
         try:
             while True:
-                msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "status":
-                    self.set_status(msg[1])
-                elif kind == "plan":
-                    self.begin_drawing(msg[1], msg[2])
-                elif kind == "stopped":
-                    self.end_run("Stopped.")
-                elif kind == "error":
-                    self.end_run("Something went wrong: " + msg[1])
-        except queue.Empty:
-            pass
-        self.root.after(80, self.poll)
+                try:
+                    msg = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.handle(msg)
+                except Exception as e:
+                    self.end_run(f"Something went wrong: {type(e).__name__}: {e}")
+        finally:
+            self.root.after(80, self.poll)
+
+    def handle(self, msg):
+        kind = msg[0]
+        if kind == "status":
+            self.set_status(msg[1])
+        elif kind == "plan":
+            self.begin_drawing(msg[1], msg[2])
+        elif kind == "drawn":
+            self.finish(msg[1], stopped=msg[2], error=msg[3])
+        elif kind == "stopped":
+            self.end_run("Stopped.")
+        elif kind == "error":
+            self.end_run("Something went wrong: " + msg[1])
 
     def begin_drawing(self, plan, o):
         self.bar.stop()
         self.bar.configure(mode="determinate", value=0)
-        self.drawing = Drawing(plan, o["seconds"], o["record"])
-        if o["record"] and self.drawing.video_failed:
+        d = Drawing(plan, o["seconds"], o["record"])
+        if o["record"] and d.video_failed:
             self.set_status("Video recording is not available on this PC. Drawing without it.")
-        colors = ([plan["line_color"]] if self.drawing.has_outline else []) + list(plan["palette"])
-        self.palette_colors = colors
-        self.draw_palette(colors, 0)
+        self.drawing = d
+        self.palette_colors = ([plan["line_color"]] if d.has_outline else []) + list(plan["palette"])
+        self.shown_swatch = -1
+        self.draw_palette(self.palette_colors, 0)
         self.skip_btn.config(state="normal")
         self.img_item = None
-        self.run_tick()
+        self.render = {"frame": None, "progress": 0.0, "label": "", "swatch": 0, "version": 0, "seen": 0, "active": True}
+        self.render_lock = threading.Lock()
+        # The drawing and the video recording run in their own thread, so this window can never freeze while it draws.
+        threading.Thread(target=self.render_loop, args=(d,), daemon=True).start()
+        self.root.after(40, self.watch_render)
 
-    def run_tick(self):
-        d = self.drawing
-        if d is None:
-            return
-        t0 = time.perf_counter()
-        if stop_flag.is_set():
-            self.finish(stopped=True)
-            return
-        frame = d.step()
-        self.show(frame)
-        self.bar.configure(value=d.progress * 100)
-        if d.label:
-            self.set_status(d.label)
-        self.draw_palette(self.palette_colors, d.swatch)
-        if d.finished:
-            self.finish(stopped=False)
-            return
-        wait = max(1, int(1000 / FPS - (time.perf_counter() - t0) * 1000))
-        self.root.after(wait, self.run_tick)
+    def render_loop(self, d):
+        err = None
+        try:
+            while not d.finished and not stop_flag.is_set():
+                t0 = time.perf_counter()
+                frame = d.step()
+                with self.render_lock:
+                    r = self.render
+                    r.update(frame=frame, progress=d.progress, label=d.label, swatch=d.swatch, version=r["version"] + 1)
+                if not d.instant:
+                    time.sleep(max(0.0, 1.0 / FPS - (time.perf_counter() - t0)))
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        try:
+            d.finalize()
+        except Exception as e:
+            err = err or f"{type(e).__name__}: {e}"
+        self.render["active"] = False
+        self.q.put(("drawn", d, stop_flag.is_set(), err))
 
-    def finish(self, stopped):
-        d = self.drawing
-        d.finalize()
+    def watch_render(self):
+        """Shows the newest drawn frame (about 25 times a second). Cheap, so the window stays smooth."""
+        try:
+            r = self.render
+            with self.render_lock:
+                fresh = r["version"] != r["seen"]
+                frame, prog, label, sw = r["frame"], r["progress"], r["label"], r["swatch"]
+                r["seen"] = r["version"]
+            if fresh and frame is not None:
+                self.show(frame)
+                self.bar.configure(value=prog * 100)
+                if label:
+                    self.set_status(label)
+                if sw != self.shown_swatch:
+                    self.shown_swatch = sw
+                    self.draw_palette(self.palette_colors, sw)
+        except Exception:
+            pass
+        if self.render["active"]:
+            self.root.after(40, self.watch_render)
+
+    def finish(self, d, stopped, error=None):
+        self.drawing = None
         self.final_img = d.image()
-        self.video_path = d.video_path
+        self.video_path = d.video_path if (d.video_path and os.path.exists(d.video_path)) else None
         self.show(np.array(self.final_img))
         self.bar.configure(value=100)
         self.draw_palette(self.palette_colors, len(self.palette_colors))
-        self.end_run("Stopped. Here is what was drawn so far." if stopped else "Done! Your drawing is ready.")
+        if error:
+            msg = "A problem stopped the drawing early (" + error + "). Here is what was drawn."
+        elif stopped:
+            msg = "Stopped. Here is what was drawn so far."
+        else:
+            msg = "Done! Your drawing is ready."
+        self.end_run(msg)
         self.results.pack(fill="x", pady=(4, 0))
         if self.video_path:
             self.watch_btn.pack(fill="x", pady=2)
             self.dl_video_btn.pack(fill="x", pady=2)
         self.dl_image_btn.pack(fill="x", pady=2)
+
+    def on_ui_error(self, exc, val, tb):
+        try:
+            self.end_run(f"Something went wrong: {exc.__name__}: {val}")
+        except Exception:
+            pass
 
     def end_run(self, text):
         self.bar.stop()
@@ -950,8 +1078,36 @@ class App:
         self.root.destroy()
 
 
+_lock_socket = None
+
+
+def only_one_copy():
+    """A second copy of the app never opens: it closes straight away instead of starting again and again."""
+    global _lock_socket
+    import socket
+    try:
+        _lock_socket = socket.socket()
+        _lock_socket.bind(("127.0.0.1", 47653))
+        return True
+    except OSError:
+        return False
+
+
+def raise_window_priority():
+    """Windows: keep this window's thread ahead of the heavy image-model threads, so it stays responsive."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.SetThreadPriority(k.GetCurrentThread(), 1)
+    except Exception:
+        pass
+
+
 def main():
     multiprocessing.freeze_support()                           # needed for the packaged Windows app
+    if not only_one_copy():
+        return
+    raise_window_priority()
     root = tk.Tk()
     App(root)
     root.mainloop()
