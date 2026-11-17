@@ -1,4 +1,4 @@
-# 🪶✨ Drawable AI 🎨
+# Drawable AI 🎨
 
 **Type what you imagine. Watch it get drawn.**
 
