@@ -39,12 +39,6 @@ FPS = 24
 HOLD_SECONDS = 1.5                                              # the finished picture stays on screen this long in the video
 WHITE, NONE = 254, 255                                          # label values: paper left white / dark outline pixel
 
-# colors and font for the window
-FONT = "Segoe UI"
-BG, HEAD, BORDER = "#f5f3ee", "#1f2937", "#e3ded3"
-TEXT, MUTED = "#1f2937", "#78716c"
-ACCENT, ACCENT_DARK = "#e8590c", "#c94a08"
-
 stop_flag = threading.Event()
 
 
@@ -160,7 +154,7 @@ def clean_prompt(text):
 def wanted_colors(text):
     """If the prompt says 'exactly 25 colours', return 25."""
     m = re.search(r"exactly\s+(\d+)\s+colou?rs?", text, re.I)
-    return max(6, min(32, int(m.group(1)))) if m else None
+    return max(6, min(100, int(m.group(1)))) if m else None
 
 
 def encode_long(p, text, max_chunks=4):
@@ -213,6 +207,140 @@ def load_image(path):
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
         img = Image.alpha_composite(bg, img)
     return img.convert("RGB")
+
+
+# ------------------------------------------------------------------ combining and editing pictures
+LAYOUTS = ["Side by side", "Top to bottom", "Grid", "Blend"]
+FILTERS = ["None", "Black & white", "Sepia", "Warm", "Cool", "Vivid", "Soft"]
+CHANGE = {"Low": 0.4, "Medium": 0.55, "High": 0.8}                # how much the AI may change the pictures
+DEFAULT_EDITS = {"brightness": 0, "contrast": 100, "saturation": 100, "blur": 0, "sharpen": 0,
+                 "filter": "None", "rotate": 0, "flip": False}
+
+
+def edits_changed(e):
+    return any(e.get(k) != v for k, v in DEFAULT_EDITS.items())
+
+
+def _cover(im, w, h):
+    """Resize to fill w x h, cutting off the extra edges."""
+    s = max(w / im.width, h / im.height)
+    im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.LANCZOS)
+    x, y = (im.width - w) // 2, (im.height - h) // 2
+    return im.crop((x, y, x + w, y + h))
+
+
+def _fit_max(im, max_side):
+    s = max_side / max(im.size)
+    return im if s >= 1 else im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.LANCZOS)
+
+
+def combine_images(imgs, layout="Side by side", max_side=1600):
+    """Puts several pictures into one."""
+    imgs = [i.convert("RGB") for i in imgs]
+    n = len(imgs)
+    if n == 1:
+        return _fit_max(imgs[0], max_side)
+    if layout == "Side by side":
+        hh = int(min(900, max(256, sorted(i.height for i in imgs)[n // 2])))
+        row = [i.resize((max(1, round(i.width * hh / i.height)), hh), Image.LANCZOS) for i in imgs]
+        out = Image.new("RGB", (sum(i.width for i in row), hh), "white")
+        x = 0
+        for i in row:
+            out.paste(i, (x, 0))
+            x += i.width
+    elif layout == "Top to bottom":
+        ww = int(min(900, max(256, sorted(i.width for i in imgs)[n // 2])))
+        col = [i.resize((ww, max(1, round(i.height * ww / i.width))), Image.LANCZOS) for i in imgs]
+        out = Image.new("RGB", (ww, sum(i.height for i in col)), "white")
+        y = 0
+        for i in col:
+            out.paste(i, (0, y))
+            y += i.height
+    elif layout == "Grid":
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        cw = 512
+        ch = int(min(768, max(288, cw * imgs[0].height / imgs[0].width)))
+        out = Image.new("RGB", (cols * cw, rows * ch), "white")
+        for k, i in enumerate(imgs):
+            out.paste(_cover(i, cw, ch), ((k % cols) * cw, (k // cols) * ch))
+    else:                                                       # Blend: all pictures laid on top of each other
+        first = _fit_max(imgs[0], max_side)
+        acc = np.zeros((first.height, first.width, 3), np.float32)
+        for i in imgs:
+            acc += np.array(_cover(i, first.width, first.height), np.float32)
+        out = Image.fromarray((acc / n).astype(np.uint8))
+    return _fit_max(out, max_side)
+
+
+def apply_edits(img, e):
+    """Brightness, contrast, color, filters, blur, sharpen, flip and rotate."""
+    e = {**DEFAULT_EDITS, **e}
+    a = np.array(img.convert("RGB"), np.float32)
+    if e["flip"]:
+        a = a[:, ::-1]
+    if e["rotate"]:
+        a = np.rot90(a, k=-(int(e["rotate"]) // 90) % 4)
+    a = np.ascontiguousarray(a)
+    sat, con = e["saturation"] / 100.0, e["contrast"] / 100.0
+    f = e["filter"]
+    if f == "Vivid":
+        sat, con = sat * 1.35, con * 1.1
+    elif f == "Black & white":
+        g = a @ np.array([0.299, 0.587, 0.114], np.float32)
+        a = np.repeat(g[..., None], 3, axis=2)
+    elif f == "Sepia":
+        a = a @ np.array([[.393, .349, .272], [.769, .686, .534], [.189, .168, .131]], np.float32)
+    elif f == "Warm":
+        a[..., 0] *= 1.08
+        a[..., 2] *= 0.92
+    elif f == "Cool":
+        a[..., 0] *= 0.92
+        a[..., 2] *= 1.08
+    elif f == "Soft":
+        a = 0.5 * a + 0.5 * cv2.GaussianBlur(a, (0, 0), 3)
+    if abs(sat - 1.0) > 0.01:
+        hsv = cv2.cvtColor(np.clip(a, 0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[..., 1] = np.clip(hsv[..., 1] * sat, 0, 255)
+        a = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+    a = (a - 128.0) * con + 128.0 + e["brightness"] * 2.55
+    if e["blur"] > 0:
+        a = cv2.GaussianBlur(a, (0, 0), float(e["blur"]))
+    if e["sharpen"] > 0:
+        a = a + (a - cv2.GaussianBlur(a, (0, 0), 2.0)) * (e["sharpen"] * 0.5)
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+
+
+def restyle_image(img, prompt, change, status):
+    """Lets the AI blend and change the picture(s) using your words (the same AI model, in image-to-image mode)."""
+    from diffusers import AutoPipelineForImage2Image
+    p = get_pipe(status)
+    i2i = AutoPipelineForImage2Image.from_pipe(p)
+    s = 512 / max(img.size)
+    init = img.convert("RGB").resize((max(256, round(img.width * s / 8) * 8), max(256, round(img.height * s / 8) * 8)),
+                                     Image.LANCZOS)
+    text = STYLE + clean_prompt(prompt)
+    args = dict(image=init, strength=CHANGE.get(change, 0.55), num_inference_steps=4, guidance_scale=0.0)
+
+    def cb(_pipe, step, _t, kwargs):
+        if stop_flag.is_set():
+            raise Stopped()
+        status(f"Blending your pictures with the AI... step {step + 1} (a CPU can take a minute or two)")
+        return kwargs
+
+    status("Blending your pictures with the AI... (a CPU can take a minute or two)")
+    try:
+        emb = encode_long(p, text)
+    except Exception:
+        emb = None
+    try:
+        if emb is not None:
+            return i2i(prompt_embeds=emb, callback_on_step_end=cb, **args).images[0]
+        return i2i(text, callback_on_step_end=cb, **args).images[0]
+    except Stopped:
+        raise
+    except Exception:
+        return i2i(text, **args).images[0]
 
 
 # ------------------------------------------------------------------ picture -> drawing plan
@@ -383,25 +511,21 @@ def build_plan(img, max_side, colors, outlines, fill, keep_bg):
             wide[:] = False
         lab = to_lab(rgb)
         pts = lab[~wide]
-        pts = np.ascontiguousarray(pts[::max(1, len(pts) // 12000)], np.float32)
+        pts = np.ascontiguousarray(pts[::max(1, len(pts) // (12000 if colors <= 32 else 24000))], np.float32)
         k = int(max(1, min(colors, len(pts))))
         cv2.setRNGSeed(12345)
         _, _, cents = cv2.kmeans(pts, k, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 0.5),
                                  3, cv2.KMEANS_PP_CENTERS)
-        cents = list(cents)
-        merged = True
-        while merged:                                           # merge colors that look the same
-            merged = False
-            for i in range(len(cents)):
-                for j in range(i + 1, len(cents)):
-                    if np.linalg.norm(cents[i] - cents[j]) < 7:
-                        cents[i] = (cents[i] + cents[j]) / 2
-                        del cents[j]
-                        merged = True
-                        break
-                if merged:
-                    break
         cents = np.array(cents, np.float32)
+        thr = 7.0 if colors <= 32 else (4.0 if colors <= 64 else 2.5)   # with many colors, keep finer differences
+        while len(cents) > 1:                                   # merge colors that look the same
+            dist = np.sqrt(((cents[:, None, :] - cents[None, :, :]) ** 2).sum(-1))
+            np.fill_diagonal(dist, np.inf)
+            i, j = np.unravel_index(int(dist.argmin()), dist.shape)
+            if dist[i, j] >= thr:
+                break
+            cents[i] = (cents[i] + cents[j]) / 2
+            cents = np.delete(cents, j, axis=0)
         k = len(cents)
         labels = np.empty((h, w), np.uint8)
         for y0 in range(0, h, 64):
@@ -414,10 +538,17 @@ def build_plan(img, max_side, colors, outlines, fill, keep_bg):
             table = np.zeros(int(lbl.max()) + 1, np.uint8)
             table[lbl[free]] = labels[free]
             labels[wide] = table[lbl[wide]]
-        for _ in range(2):                                      # remove lonely specks
-            scores = np.stack([cv2.blur((labels == c).astype(np.float32), (3, 3)) for c in range(k)], -1)
-            own = np.take_along_axis(scores, labels[..., None].astype(np.int64), -1)[..., 0]
-            labels = np.where(own * 9 <= 2.01, scores.argmax(-1).astype(np.uint8), labels)
+        for _ in range(2):                                      # remove lonely specks (one color at a time, so 100 colors stay light on memory)
+            own = np.zeros((h, w), np.float32)
+            best = np.full((h, w), -1.0, np.float32)
+            arg = np.zeros((h, w), np.uint8)
+            for c in range(k):
+                sc = cv2.blur((labels == c).astype(np.float32), (3, 3))
+                own = np.where(labels == c, sc, own)
+                better = sc > best
+                best = np.where(better, sc, best)
+                arg = np.where(better, np.uint8(c), arg)
+            labels = np.where(own * 9 <= 2.01, arg, labels)
         pal = []
         for c in range(k):
             m = labels == c
@@ -676,181 +807,356 @@ class Drawing:
 
 
 # ------------------------------------------------------------------ the window
-def mix(color, amount):
-    """Fade a color toward white (amount 0 = same, 1 = white)."""
-    return "#%02x%02x%02x" % tuple(int(c * (1 - amount) + 255 * amount) for c in color)
+def mixhex(color, amount, base):
+    """Fade an (r, g, b) color toward a base hex color (amount 0 = same, 1 = base)."""
+    b = tuple(int(base[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(c * (1 - amount) + bc * amount) for c, bc in zip(color, b))
+
+
+# the two looks: light (sun) and dark (moon)
+THEMES = {
+    "light": dict(BG="#f5f3ee", HEAD="#1f2937", CARD="#ffffff", INPUT="#faf8f3", BORDER="#e3ded3", TEXT="#1f2937",
+                  MUTED="#78716c", ACCENT="#e8590c", ACCENT_DARK="#c94a08", ACCENT_OFF="#f1b79a", HOVER="#f1ede4",
+                  PAPER="#fbfaf7", TROUGH="#e8e4da", HINT="#a8a29e", DISABLED="#b5afa3", HEADMUTED="#cbd5e1"),
+    "dark": dict(BG="#14171c", HEAD="#0b0e12", CARD="#1d2229", INPUT="#161a20", BORDER="#2c333c", TEXT="#f1efe9",
+                 MUTED="#a8a196", ACCENT="#ff7a33", ACCENT_DARK="#ff9257", ACCENT_OFF="#6b3a1f", HOVER="#262d36",
+                 PAPER="#0f1216", TROUGH="#2c333c", HINT="#6b645a", DISABLED="#5b6470", HEADMUTED="#9aa4b2"),
+}
+FONT = "Segoe UI"
+
+# which colors each kind of widget uses (T is the current look)
+ROLES = {
+    "bg": lambda T: dict(bg=T["BG"]),
+    "head": lambda T: dict(bg=T["HEAD"]),
+    "headname": lambda T: dict(bg=T["HEAD"], fg="#ffffff"),
+    "headtag": lambda T: dict(bg=T["HEAD"], fg=T["HEADMUTED"]),
+    "card": lambda T: dict(bg=T["CARD"], highlightbackground=T["BORDER"]),
+    "cardin": lambda T: dict(bg=T["CARD"]),
+    "label": lambda T: dict(bg=T["CARD"], fg=T["TEXT"]),
+    "muted": lambda T: dict(bg=T["CARD"], fg=T["MUTED"]),
+    "bglabel": lambda T: dict(bg=T["BG"], fg=T["TEXT"]),
+    "text": lambda T: dict(bg=T["INPUT"], fg=T["TEXT"], insertbackground=T["TEXT"],
+                           highlightbackground=T["BORDER"], highlightcolor=T["ACCENT"]),
+    "check": lambda T: dict(bg=T["CARD"], fg=T["TEXT"], activebackground=T["CARD"], activeforeground=T["TEXT"],
+                            selectcolor=T["INPUT"]),
+    "scale": lambda T: dict(bg=T["CARD"], fg=T["TEXT"], troughcolor=T["TROUGH"], activebackground=T["ACCENT"]),
+    "btn": lambda T: dict(bg=T["CARD"], fg=T["TEXT"], activebackground=T["HOVER"], activeforeground=T["TEXT"],
+                          disabledforeground=T["DISABLED"], highlightbackground=T["BORDER"]),
+    "canvas": lambda T: dict(bg=T["PAPER"]),
+}
 
 
 class App:
-    CW, CH = 600, 480
+    CW, CH = 600, 380
 
     def __init__(self, root):
         from PIL import ImageTk
         self.ImageTk = ImageTk
         self.root = root
         root.title("Drawable")
-        w = min(1060, max(800, root.winfo_screenwidth() - 40))
-        h = min(700, max(560, root.winfo_screenheight() - 90))
+        try:                                                     # the Drawable logo in the window corner
+            root.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "Drawable.ico"))
+        except Exception:
+            pass
+        w = min(1100, max(800, root.winfo_screenwidth() - 40))
+        h = min(720, max(560, root.winfo_screenheight() - 90))
         root.geometry(f"{w}x{h}")
-        root.minsize(min(w, 940), min(h, 600))
+        root.minsize(min(w, 960), min(h, 600))
         self.q = queue.Queue()
         self.drawing = None
         self.final_img = None
+        self.source_img = None
+        self.source_kind = "imagined"
         self.video_path = None
         self.photo = None
         self.img_item = None
-        self.image_path = ""
-        self.swatches = []
+        self.pics = []
+        self.theme = "light"
+        self.T = THEMES["light"]
+        self.reg = []                                            # every widget with its look, so the theme can change
+        self.combos = []
+        self.palette_colors = []
+        self.shown_swatch = -1
         self._build()
+        self.apply_theme()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.report_callback_exception = self.on_ui_error        # a mistake inside a button never leaves the app stuck
         root.after(80, self.poll)
 
+    # ---- look
+    def _t(self, widget, role):
+        self.reg.append((widget, role))
+        return widget
+
+    def apply_theme(self):
+        T = self.T
+        for w, role in self.reg:
+            try:
+                if role == "primary":
+                    ok = str(w["state"]) == "normal"
+                    w.config(bg=T["ACCENT"] if ok else T["ACCENT_OFF"], fg="#ffffff", activebackground=T["ACCENT_DARK"],
+                             activeforeground="#ffffff", disabledforeground="#ffffff")
+                else:
+                    w.config(**ROLES[role](T))
+            except Exception:
+                pass
+        try:
+            self.root.configure(bg=T["BG"])
+            st = ttk.Style()
+            st.configure("TCombobox", fieldbackground=T["INPUT"], background=T["CARD"], foreground=T["TEXT"],
+                         arrowcolor=T["TEXT"], bordercolor=T["BORDER"], lightcolor=T["INPUT"], darkcolor=T["INPUT"],
+                         padding=4)
+            st.map("TCombobox", fieldbackground=[("readonly", T["INPUT"])], foreground=[("readonly", T["TEXT"])],
+                   background=[("readonly", T["CARD"])], selectbackground=[("readonly", T["INPUT"])],
+                   selectforeground=[("readonly", T["TEXT"])])
+            st.configure("TNotebook", background=T["CARD"], borderwidth=0)
+            st.configure("TNotebook.Tab", background=T["BG"], foreground=T["MUTED"], padding=(16, 6),
+                         font=(FONT, 10, "bold"), borderwidth=0)
+            st.map("TNotebook.Tab", background=[("selected", T["CARD"])], foreground=[("selected", T["ACCENT"])])
+            st.configure("Drawable.Horizontal.TProgressbar", troughcolor=T["TROUGH"], background=T["ACCENT"],
+                         lightcolor=T["ACCENT"], darkcolor=T["ACCENT"], bordercolor=T["TROUGH"], thickness=10)
+            for cb in self.combos:                               # the drop-down lists
+                try:
+                    pop = self.root.tk.call("ttk::combobox::PopdownWindow", str(cb))
+                    self.root.tk.call(f"{pop}.f.l", "configure", "-background", T["INPUT"], "-foreground", T["TEXT"],
+                                      "-selectbackground", T["ACCENT"], "-selectforeground", "#ffffff")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.draw_theme_icon()
+        self.draw_hint()
+        if self.palette_colors:
+            self.draw_palette(self.palette_colors, self.shown_swatch)
+        self.set_status(self.status.get())
+
+    def toggle_theme(self, _event=None):
+        self.theme = "dark" if self.theme == "light" else "light"
+        self.T = THEMES[self.theme]
+        self.apply_theme()
+
+    def draw_theme_icon(self):
+        c, T = self.theme_btn, self.T
+        c.delete("all")
+        c.config(bg=T["HEAD"])
+        x, y = 22, 22
+        if self.theme == "light":                                # the sun
+            for k in range(8):
+                a = k * math.pi / 4
+                c.create_line(x + 11 * math.cos(a), y + 11 * math.sin(a), x + 15 * math.cos(a), y + 15 * math.sin(a),
+                              fill="#fbbf24", width=2, capstyle="round")
+            c.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#fbbf24", outline="#f59e0b")
+        else:                                                    # the moon
+            c.create_oval(x - 10, y - 10, x + 10, y + 10, fill="#e5e7eb", outline="")
+            c.create_oval(x - 5, y - 14, x + 13, y + 4, fill=T["HEAD"], outline="")
+            c.create_oval(x + 9, y + 6, x + 11, y + 8, fill="#ffffff", outline="")
+            c.create_oval(x + 3, y + 10, x + 5, y + 12, fill="#ffffff", outline="")
+
+    def draw_hint(self):
+        try:
+            self.canvas.itemconfig("hint", fill=self.T["HINT"])
+        except Exception:
+            pass
+
     # ---- layout
     def _button(self, parent, text, command, kind="plain", **kw):
-        """A flat, clean button. kind: 'primary' (orange), 'plain' (white with a border)."""
+        """A flat, clean button. kind: 'primary' (orange) or 'plain'."""
         if kind == "primary":
-            look = dict(bg=ACCENT, fg="white", activebackground=ACCENT_DARK, activeforeground="white",
-                        disabledforeground="#fbe3d6", font=(FONT, 11, "bold"), pady=7)
+            look = dict(font=(FONT, 11, "bold"), pady=7)
         else:
-            look = dict(bg="white", fg=TEXT, activebackground="#f1ede4", activeforeground=TEXT,
-                        disabledforeground="#b5afa3", font=(FONT, 10), pady=4,
-                        highlightthickness=1, highlightbackground=BORDER)
+            look = dict(font=(FONT, 10), pady=4, highlightthickness=1)
         look.update(kw)
-        b = tk.Button(parent, text=text, command=command, relief="flat", bd=0, cursor="hand2",
-                      padx=12, **look)
+        b = tk.Button(parent, text=text, command=command, relief="flat", bd=0, cursor="hand2", padx=12, **look)
+        self._t(b, "primary" if kind == "primary" else "btn")
         if kind == "primary":
-            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg=ACCENT_DARK))
-            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg=ACCENT))
+            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg=self.T["ACCENT_DARK"]))
+            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg=self.T["ACCENT"]))
         else:
-            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg="#f1ede4"))
-            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg="white"))
+            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg=self.T["HOVER"]))
+            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg=self.T["CARD"]))
         return b
 
+    def _label(self, parent, text, role="label", **kw):
+        return self._t(tk.Label(parent, text=text, **kw), role)
+
+    def _frame(self, parent, role="cardin", **kw):
+        return self._t(tk.Frame(parent, **kw), role)
+
     def _card(self, parent, **pack):
-        card = tk.Frame(parent, bg="white", highlightthickness=1, highlightbackground=BORDER)
+        card = self._t(tk.Frame(parent, highlightthickness=1), "card")
         card.pack(**pack)
         return card
 
+    def _combo(self, parent, var, values, width):
+        cb = ttk.Combobox(parent, textvariable=var, values=values, width=width, state="readonly")
+        self.combos.append(cb)
+        return cb
+
+    def _scale(self, parent, text, var, lo, hi, length=140):
+        return self._t(tk.Scale(parent, from_=lo, to=hi, orient="horizontal", variable=var, length=length, label=text,
+                                highlightthickness=0, bd=0, font=(FONT, 9)), "scale")
+
     def _build(self):
         root = self.root
-        root.configure(bg=BG)
-        style = ttk.Style()
         try:
-            style.theme_use("clam")
+            ttk.Style().theme_use("clam")                        # the one built-in look that accepts our colors
         except Exception:
             pass
-        style.configure("TCombobox", fieldbackground="white", background="white", padding=4)
-        style.configure("Drawable.Horizontal.TProgressbar", troughcolor="#e8e4da", background=ACCENT,
-                        lightcolor=ACCENT, darkcolor=ACCENT, bordercolor="#e8e4da", thickness=10)
-        root.option_add("*TCombobox*Listbox.font", (FONT, 10))
-
         root.columnconfigure(1, weight=1)
         root.rowconfigure(1, weight=1)
 
-        # ---- header
-        head = tk.Frame(root, bg=HEAD)
+        # ---- header, with the sun / moon switch in the corner
+        head = self._frame(root, "head")
         head.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(head, text="Drawable", bg=HEAD, fg="white", font=(FONT, 18, "bold")).pack(side="left", padx=(18, 10), pady=10)
-        tk.Label(head, text="Describe a picture. Watch it get drawn.", bg=HEAD, fg="#cbd5e1",
-                 font=(FONT, 10)).pack(side="left", pady=10)
+        self._label(head, "Drawable", "headname", font=(FONT, 18, "bold")).pack(side="left", padx=(18, 10), pady=10)
+        self._label(head, "Describe a picture. Edit pictures. Watch it get drawn.", "headtag",
+                    font=(FONT, 10)).pack(side="left", pady=10)
+        self.theme_btn = self._t(tk.Canvas(head, width=44, height=44, highlightthickness=0, cursor="hand2"), "head")
+        self.theme_btn.pack(side="right", padx=(0, 14), pady=9)
+        self.theme_btn.bind("<Button-1>", self.toggle_theme)
 
-        # ---- left: what to draw + options
-        left = tk.Frame(root, bg=BG)
+        left = self._frame(root, "bg")
         left.grid(row=1, column=0, sticky="ns", padx=(14, 8), pady=14)
-        right = tk.Frame(root, bg=BG)
+        right = self._frame(root, "bg")
         right.grid(row=1, column=1, sticky="nsew", padx=(0, 14), pady=14)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
 
+        # ---- left, top: what to draw / what to change
         ask = self._card(left, fill="x")
-        inner = tk.Frame(ask, bg="white")
-        inner.pack(fill="x", padx=12, pady=12)
-        tk.Label(inner, text="What should it draw?", bg="white", fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w")
-        self.prompt = tk.Text(inner, width=38, height=5, wrap="word", font=(FONT, 10), undo=True, relief="flat", bd=0,
-                              bg="#faf8f3", fg=TEXT, insertbackground=TEXT, padx=8, pady=6,
-                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        inner = self._frame(ask)
+        inner.pack(fill="x", padx=12, pady=10)
+        self._label(inner, "What should it draw or change?", font=(FONT, 10, "bold")).pack(anchor="w")
+        self.prompt = self._t(tk.Text(inner, width=38, height=4, wrap="word", font=(FONT, 10), undo=True, relief="flat",
+                                      bd=0, padx=8, pady=6, highlightthickness=1), "text")
         self.prompt.pack(fill="x", pady=(4, 8))
         self.prompt.bind("<Control-Return>", lambda e: (self.on_create(), "break")[1])
         self.create_btn = self._button(inner, "Create & draw", self.on_create, "primary")
         self.create_btn.pack(fill="x")
-        up = tk.Frame(inner, bg="white")
-        up.pack(fill="x", pady=(10, 0))
-        self._button(up, "Use my own picture", self.pick_image).pack(side="left")
-        self._button(up, "Clear", self.clear_image).pack(side="left", padx=6)
-        self.path_label = tk.Label(inner, text="No picture chosen", bg="white", fg=MUTED, font=(FONT, 9))
-        self.path_label.pack(anchor="w", pady=(4, 0))
+        up = self._frame(inner)
+        up.pack(fill="x", pady=(8, 0))
+        self._button(up, "Add pictures", self.pick_images).pack(side="left")
+        self._button(up, "Clear", self.clear_images).pack(side="left", padx=6)
+        self.path_label = self._label(inner, "No pictures chosen", "muted", font=(FONT, 9))
+        self.path_label.pack(anchor="w", pady=(3, 0))
+        self.o_draw = tk.BooleanVar(value=True)
+        self._t(tk.Checkbutton(inner, text="Draw it step by step (video + drawing)", variable=self.o_draw, font=(FONT, 10),
+                               anchor="w", highlightthickness=0), "check").pack(anchor="w", pady=(4, 0))
 
-        optc = self._card(left, fill="x", pady=(10, 0))
-        oi = tk.Frame(optc, bg="white")
-        oi.pack(fill="x", padx=12, pady=10)
-        tk.Label(oi, text="Options", bg="white", fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w")
+        # ---- left, middle: two tabs
+        tabs_card = self._card(left, fill="x", pady=(10, 0))
+        nb = ttk.Notebook(tabs_card)
+        nb.pack(fill="x", padx=4, pady=4)
+        t1 = self._frame(nb)
+        t2 = self._frame(nb)
+        nb.add(t1, text="Drawing")
+        nb.add(t2, text="Edit")
+
+        # Drawing tab
+        pad = self._frame(t1)
+        pad.pack(fill="x", padx=10, pady=8)
         self.detail, self.speed = tk.StringVar(value="Normal"), tk.StringVar(value="Normal")
-        row = tk.Frame(oi, bg="white")
-        row.pack(fill="x", pady=(6, 0))
-        tk.Label(row, text="Detail", bg="white", fg=MUTED, font=(FONT, 9)).grid(row=0, column=0, sticky="w")
-        ttk.Combobox(row, textvariable=self.detail, values=list(DETAIL), width=10, state="readonly").grid(row=0, column=1, padx=(6, 14))
-        tk.Label(row, text="Speed", bg="white", fg=MUTED, font=(FONT, 9)).grid(row=0, column=2, sticky="w")
-        ttk.Combobox(row, textvariable=self.speed, values=list(SPEED), width=9, state="readonly").grid(row=0, column=3, padx=6)
-        self.colors = tk.IntVar(value=20)
-        crow = tk.Frame(oi, bg="white")
-        crow.pack(fill="x", pady=(2, 0))
-        tk.Label(crow, text="Colors", bg="white", fg=MUTED, font=(FONT, 9)).pack(side="left")
-        tk.Scale(crow, from_=6, to=32, orient="horizontal", variable=self.colors, length=200, bg="white", fg=TEXT,
-                 troughcolor="#e8e4da", highlightthickness=0, bd=0, activebackground=ACCENT,
-                 font=(FONT, 9)).pack(side="left", padx=8)
+        row = self._frame(pad)
+        row.pack(fill="x")
+        self._label(row, "Detail", "muted", font=(FONT, 9)).grid(row=0, column=0, sticky="w")
+        self._combo(row, self.detail, list(DETAIL), 10).grid(row=0, column=1, padx=(6, 14))
+        self._label(row, "Speed", "muted", font=(FONT, 9)).grid(row=0, column=2, sticky="w")
+        self._combo(row, self.speed, list(SPEED), 9).grid(row=0, column=3, padx=6)
+        self.colors = tk.IntVar(value=24)
+        self._scale(pad, "Colors (6 to 100)", self.colors, 6, 100, 280).pack(fill="x", pady=(4, 0))
         self.o_outline, self.o_fill = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
         self.o_bg, self.o_rec = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
-        for text, var in (("Outlines first", self.o_outline), ("Fill in colors", self.o_fill),
-                          ("Draw the background", self.o_bg), ("Record the video", self.o_rec)):
-            tk.Checkbutton(oi, text=text, variable=var, bg="white", fg=TEXT, activebackground="white",
-                           selectcolor="white", font=(FONT, 10), anchor="w", highlightthickness=0).pack(anchor="w")
+        grid = self._frame(pad)
+        grid.pack(fill="x")
+        for i, (text, var) in enumerate((("Outlines first", self.o_outline), ("Fill in colors", self.o_fill),
+                                         ("Draw the background", self.o_bg), ("Record the video", self.o_rec))):
+            self._t(tk.Checkbutton(grid, text=text, variable=var, font=(FONT, 10), anchor="w", highlightthickness=0),
+                    "check").grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 12))
 
-        prog = self._card(left, fill="x", pady=(10, 0))
-        pi = tk.Frame(prog, bg="white")
-        pi.pack(fill="x", padx=12, pady=10)
-        self.status = tk.StringVar(value="Ready. Type what you want drawn, then press Create & draw.")
-        self.status_label = tk.Label(pi, textvariable=self.status, wraplength=300, justify="left", bg="white", fg=TEXT,
-                                     font=(FONT, 10))
-        self.status_label.pack(anchor="w", pady=(0, 6))
-        self.bar = ttk.Progressbar(pi, mode="determinate", maximum=100, style="Drawable.Horizontal.TProgressbar")
-        self.bar.pack(fill="x")
-        ctl = tk.Frame(pi, bg="white")
-        ctl.pack(fill="x", pady=(8, 0))
-        self.stop_btn = self._button(ctl, "Stop", self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left")
-        self.skip_btn = self._button(ctl, "Skip ahead", self.on_skip, state="disabled")
-        self.skip_btn.pack(side="left", padx=6)
+        # Edit tab
+        pad2 = self._frame(t2)
+        pad2.pack(fill="x", padx=10, pady=8)
+        self.layout, self.change = tk.StringVar(value=LAYOUTS[0]), tk.StringVar(value="Medium")
+        r1 = self._frame(pad2)
+        r1.pack(fill="x")
+        self._label(r1, "Combine", "muted", font=(FONT, 9)).grid(row=0, column=0, sticky="w")
+        self._combo(r1, self.layout, LAYOUTS, 12).grid(row=0, column=1, padx=(6, 12))
+        self._label(r1, "AI change", "muted", font=(FONT, 9)).grid(row=0, column=2, sticky="w")
+        self._combo(r1, self.change, list(CHANGE), 8).grid(row=0, column=3, padx=6)
+        self.o_ai = tk.BooleanVar(value=True)
+        self._t(tk.Checkbutton(pad2, text="Let the AI blend my pictures using my words", variable=self.o_ai,
+                               font=(FONT, 10), anchor="w", highlightthickness=0), "check").pack(anchor="w", pady=(2, 0))
+        self.e_bright, self.e_contrast, self.e_sat = tk.IntVar(value=0), tk.IntVar(value=100), tk.IntVar(value=100)
+        self.e_blur, self.e_sharp = tk.IntVar(value=0), tk.IntVar(value=0)
+        sc = self._frame(pad2)
+        sc.pack(fill="x")
+        for i, (text, var, lo, hi) in enumerate((("Brightness", self.e_bright, -100, 100), ("Contrast", self.e_contrast, 50, 150),
+                                                 ("Color", self.e_sat, 0, 200), ("Blur", self.e_blur, 0, 10),
+                                                 ("Sharpen", self.e_sharp, 0, 10))):
+            self._scale(sc, text, var, lo, hi, 130).grid(row=i // 2, column=i % 2, padx=(0, 10), sticky="w")
+        self.e_filter, self.e_rotate = tk.StringVar(value="None"), tk.StringVar(value="0")
+        self.e_flip = tk.BooleanVar(value=False)
+        cell = self._frame(sc)
+        cell.grid(row=2, column=1, sticky="w")
+        self._t(tk.Checkbutton(cell, text="Flip left-right", variable=self.e_flip, font=(FONT, 10), anchor="w",
+                               highlightthickness=0), "check").pack(anchor="w")
+        self._button(cell, "Reset edits", self.reset_edits).pack(anchor="w", pady=(4, 0))
+        r3 = self._frame(pad2)
+        r3.pack(fill="x", pady=(2, 0))
+        self._label(r3, "Filter", "muted", font=(FONT, 9)).grid(row=0, column=0, sticky="w")
+        self._combo(r3, self.e_filter, FILTERS, 12).grid(row=0, column=1, padx=(6, 12))
+        self._label(r3, "Turn", "muted", font=(FONT, 9)).grid(row=0, column=2, sticky="w")
+        self._combo(r3, self.e_rotate, ["0", "90", "180", "270"], 5).grid(row=0, column=3, padx=6)
 
-        # ---- right: colors in use, the drawing paper, and the download buttons
-        self.pal = tk.Canvas(right, height=34, highlightthickness=0, bg=BG)
+        # ---- right: colors in use, the drawing paper, progress, download buttons
+        self.pal = self._t(tk.Canvas(right, height=30, highlightthickness=0), "bg")
         self.pal.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        paper = tk.Frame(right, bg="white", highlightthickness=1, highlightbackground=BORDER)
+        paper = self._frame(right, "card", highlightthickness=1)
         paper.grid(row=1, column=0, sticky="nsew")
-        self.canvas = tk.Canvas(paper, width=self.CW, height=self.CH, bg="#fbfaf7", highlightthickness=0)
+        self.canvas = self._t(tk.Canvas(paper, width=self.CW, height=self.CH, highlightthickness=0), "canvas")
         self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
         self.canvas.create_text(self.CW // 2, self.CH // 2, text="Your drawing will appear here", fill="#a8a29e",
                                 font=(FONT, 14), tags="hint")
 
-        self.results = tk.Frame(right, bg=BG)
-        self.results.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        prog = self._frame(right, "bg")
+        prog.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.status = tk.StringVar(value="Ready. Type what you want drawn, then press Create & draw.")
+        self.status_label = self._label(prog, "", "bglabel", textvariable=self.status, wraplength=640, justify="left",
+                                        font=(FONT, 10), anchor="w")
+        self.status_label.pack(fill="x", pady=(0, 6))
+        pr = self._frame(prog, "bg")
+        pr.pack(fill="x")
+        self.bar = ttk.Progressbar(pr, mode="determinate", maximum=100, style="Drawable.Horizontal.TProgressbar")
+        self.bar.pack(side="left", fill="x", expand=True)
+        self.skip_btn = self._button(pr, "Skip ahead", self.on_skip, state="disabled")
+        self.skip_btn.pack(side="right", padx=(8, 0))
+        self.stop_btn = self._button(pr, "Stop", self.on_stop, state="disabled")
+        self.stop_btn.pack(side="right", padx=(8, 0))
+
+        self.results = self._frame(right, "bg")
+        self.results.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         self.results.grid_remove()
-        tk.Label(self.results, text="Your drawing is ready", bg=BG, fg=TEXT, font=(FONT, 11, "bold")).pack(side="left", padx=(0, 12))
-        self.dl_image_btn = self._button(self.results, "Download drawing", self.download_image, "primary")
-        self.dl_video_btn = self._button(self.results, "Download video", self.download_video, "primary")
-        self.watch_btn = self._button(self.results, "Watch video", self.watch_video)
+        self.results_title = self._label(self.results, "Your drawing is ready", "bglabel", font=(FONT, 11, "bold"))
+        self.results_title.pack(anchor="w", pady=(0, 6))
+        btns = self._frame(self.results, "bg")
+        btns.pack(anchor="w")
+        self.dl_image_btn = self._button(btns, "Download drawing", self.download_image, "primary")
+        self.dl_video_btn = self._button(btns, "Download video", self.download_video, "primary")
+        self.dl_src_btn = self._button(btns, "Download picture", self.download_source)
+        self.watch_btn = self._button(btns, "Watch video", self.watch_video)
 
     # ---- small helpers
     def set_status(self, text):
         self.status.set(text)
         bad = text.startswith(("Something went wrong", "A problem", "Could not"))
         try:
-            self.status_label.config(fg="#b91c1c" if bad else TEXT)
+            self.status_label.config(fg="#ef4444" if bad else self.T["TEXT"])
         except Exception:
             pass
 
     def set_busy(self, busy):
-        self.create_btn.config(state="disabled" if busy else "normal", bg="#f1b79a" if busy else ACCENT)
+        self.create_btn.config(state="disabled" if busy else "normal",
+                               bg=self.T["ACCENT_OFF"] if busy else self.T["ACCENT"])
         self.stop_btn.config(state="normal" if busy else "disabled")
         self.skip_btn.config(state="disabled")
 
@@ -871,16 +1177,26 @@ class App:
             self.canvas.itemconfig(self.img_item, image=self.photo)
 
     def draw_palette(self, colors, active):
+        """The strip of colors. It shrinks the swatches to fit, so even 100 colors fit on one line."""
         self.pal.delete("all")
+        try:
+            width = max(200, int(self.pal.winfo_width()))
+        except Exception:
+            width = 600
+        n = max(1, len(colors))
+        sw = max(4, min(24, (width - 8) // n))
+        gap = 4 if sw >= 14 else (1 if sw >= 8 else 0)
         for i, col in enumerate(colors):
-            x = 4 + i * 28
-            shown = col if i <= active else mix(col, 0.6)        # colors not used yet look faded
-            self.pal.create_rectangle(x, 4, x + 24, 28, fill=mix(col, 0) if i <= active else shown,
-                                      outline="#111111" if i == active else "#bbbbbb", width=3 if i == active else 1)
+            x = 4 + i * (sw + gap)
+            fill = mixhex(col, 0.0 if i <= active else 0.65, self.T["BG"])
+            if i == active and sw >= 8:
+                self.pal.create_rectangle(x, 2, x + sw, 26, fill=fill, outline=self.T["TEXT"], width=2)
+            else:
+                self.pal.create_rectangle(x, 4, x + sw, 24, fill=fill, outline=self.T["BORDER"] if sw >= 8 else fill)
 
     def clear_results(self):
         self.results.grid_remove()
-        for b in (self.watch_btn, self.dl_video_btn, self.dl_image_btn):
+        for b in (self.watch_btn, self.dl_video_btn, self.dl_image_btn, self.dl_src_btn):
             b.pack_forget()
         if self.video_path:
             try:
@@ -889,44 +1205,69 @@ class App:
                 pass
         self.video_path = None
         self.final_img = None
+        self.source_img = None
 
-    # ---- picking a picture
-    def pick_image(self):
-        p = filedialog.askopenfilename(title="Choose a picture",
-                                       filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
-        if p:
-            self.image_path = p
-            self.path_label.config(text=os.path.basename(p))
+    # ---- pictures and edits
+    def pick_images(self):
+        ps = filedialog.askopenfilenames(title="Choose one or more pictures",
+                                         filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
+        if ps:
+            self.pics = list(ps)
+            self._pics_label()
 
-    def clear_image(self):
-        self.image_path = ""
-        self.path_label.config(text="No picture chosen")
+    def clear_images(self):
+        self.pics = []
+        self._pics_label()
+
+    def _pics_label(self):
+        n = len(self.pics)
+        self.path_label.config(text="No pictures chosen" if n == 0 else
+                               os.path.basename(self.pics[0]) if n == 1 else f"{n} pictures chosen (they will be combined)")
+
+    def reset_edits(self):
+        self.e_bright.set(0)
+        self.e_contrast.set(100)
+        self.e_sat.set(100)
+        self.e_blur.set(0)
+        self.e_sharp.set(0)
+        self.e_filter.set("None")
+        self.e_rotate.set("0")
+        self.e_flip.set(False)
+
+    def read_edits(self):
+        return {"brightness": int(self.e_bright.get()), "contrast": int(self.e_contrast.get()),
+                "saturation": int(self.e_sat.get()), "blur": int(self.e_blur.get()), "sharpen": int(self.e_sharp.get()),
+                "filter": self.e_filter.get(), "rotate": int(self.e_rotate.get()), "flip": bool(self.e_flip.get())}
 
     # ---- start / stop
     def on_create(self):
         if self.create_btn["state"] == "disabled":
             return
         prompt = self.prompt.get("1.0", "end").strip()
-        if not prompt and not self.image_path:
-            self.set_status("Type what you want drawn, or choose your own picture.")
+        pics = list(self.pics)
+        if not prompt and not pics:
+            self.set_status("Type what you want drawn, or add your own pictures.")
             return
-        if not self.o_outline.get() and not self.o_fill.get():
+        draw = bool(self.o_draw.get())
+        if draw and not self.o_outline.get() and not self.o_fill.get():
             self.set_status("Turn on Outlines first and/or Fill in colors.")
             return
         seconds = SPEED[self.speed.get()]
         opts = {"max_side": DETAIL[self.detail.get()], "colors": int(self.colors.get()),
                 "outlines": self.o_outline.get(), "fill": self.o_fill.get(), "bg": self.o_bg.get(),
-                "seconds": seconds, "record": bool(self.o_rec.get()) and seconds > 0}
+                "seconds": seconds, "record": bool(self.o_rec.get()) and seconds > 0, "draw": draw,
+                "layout": self.layout.get(), "change": self.change.get(), "ai": bool(self.o_ai.get()),
+                "edits": self.read_edits()}
         stop_flag.clear()
         self.clear_results()
         self.drawing = None
         self.set_busy(True)
         self.bar.configure(mode="indeterminate")
         self.bar.start(12)
-        threading.Thread(target=self.work, args=(prompt, self.image_path, opts), daemon=True).start()
+        threading.Thread(target=self.work, args=(prompt, pics, opts), daemon=True).start()
 
-    def work(self, prompt, path, o):
-        """Runs in the background: imagines (or loads) the picture and plans the drawing."""
+    def work(self, prompt, pics, o):
+        """Runs in the background: makes the picture (imagined, or combined from yours), edits it, plans the drawing."""
         say = lambda t: self.q.put(("status", t))
         try:
             if prompt:
@@ -934,12 +1275,28 @@ class App:
                 if n:
                     o["colors"] = n
                     say(f"Your prompt asks for {n} colors - using that.")
-                img = generate_image(prompt, say)
+            if pics:
+                say(f"Loading {len(pics)} picture{'s' if len(pics) > 1 else ''}...")
+                imgs = [_fit_max(load_image(p), 1600) for p in pics]
+                if len(imgs) > 1:
+                    say(f"Combining {len(imgs)} pictures ({o['layout']})...")
+                img = combine_images(imgs, o["layout"])
+                if prompt and o["ai"]:
+                    img = restyle_image(img, prompt, o["change"], say)
+                kind = "edited"
             else:
-                say("Loading your picture...")
-                img = load_image(path)
+                img = generate_image(prompt, say)
+                kind = "imagined"
             if stop_flag.is_set():
                 raise Stopped()
+            if edits_changed(o["edits"]):
+                say("Applying your edits...")
+                img = apply_edits(img, o["edits"])
+                kind = "edited"
+            self.q.put(("source", img, kind))
+            if not o["draw"]:
+                self.q.put(("edited", img))
+                return
             say("Planning the drawing...")
             plan = build_plan(img, o["max_side"], o["colors"], o["outlines"], o["fill"], o["bg"])
             self.q.put(("plan", plan, o))
@@ -967,8 +1324,12 @@ class App:
         kind = msg[0]
         if kind == "status":
             self.set_status(msg[1])
+        elif kind == "source":
+            self.source_img, self.source_kind = msg[1], msg[2]
         elif kind == "plan":
             self.begin_drawing(msg[1], msg[2])
+        elif kind == "edited":
+            self.finish_picture(msg[1])
         elif kind == "drawn":
             self.finish(msg[1], stopped=msg[2], error=msg[3])
         elif kind == "stopped":
@@ -984,7 +1345,7 @@ class App:
             self.set_status("Video recording is not available on this PC. Drawing without it.")
         self.drawing = d
         self.palette_colors = ([plan["line_color"]] if d.has_outline else []) + list(plan["palette"])
-        self.shown_swatch = -1
+        self.shown_swatch = 0
         self.draw_palette(self.palette_colors, 0)
         self.skip_btn.config(state="normal")
         self.img_item = None
@@ -1035,6 +1396,32 @@ class App:
         if self.render["active"]:
             self.root.after(40, self.watch_render)
 
+    def _src_button_text(self):
+        return "Download edited picture" if self.source_kind == "edited" else "Download imagined picture"
+
+    def show_results(self, title, drawing_done):
+        self.results_title.config(text=title)
+        self.results.grid()
+        if drawing_done:
+            self.dl_image_btn.pack(side="left", padx=(0, 6))
+            if self.video_path:
+                self.dl_video_btn.pack(side="left", padx=(0, 6))
+        if self.source_img is not None:
+            self.dl_src_btn.config(text=self._src_button_text())
+            self.dl_src_btn.pack(side="left", padx=(0, 6))
+        if drawing_done and self.video_path:
+            self.watch_btn.pack(side="left")
+
+    def finish_picture(self, img):
+        """Edit-only run (no drawing): just show the finished picture."""
+        self.drawing = None
+        self.final_img = None
+        self.img_item = None
+        self.show(np.array(img.convert("RGB")))
+        self.bar.configure(value=100)
+        self.end_run("Done! Your picture is ready.")
+        self.show_results("Your picture is ready", False)
+
     def finish(self, d, stopped, error=None):
         self.drawing = None
         self.final_img = d.image()
@@ -1049,11 +1436,7 @@ class App:
         else:
             msg = "Done! Your drawing is ready."
         self.end_run(msg)
-        self.results.grid()
-        self.dl_image_btn.pack(side="left", padx=(0, 6))
-        if self.video_path:
-            self.dl_video_btn.pack(side="left", padx=(0, 6))
-            self.watch_btn.pack(side="left")
+        self.show_results("Your drawing is ready", True)
 
     def on_ui_error(self, exc, val, tb):
         try:
@@ -1088,6 +1471,18 @@ class App:
             except Exception as e:
                 self.set_status(f"Could not save the drawing: {e}")
 
+    def download_source(self):
+        if self.source_img is None:
+            return
+        path = filedialog.asksaveasfilename(title="Save the picture", defaultextension=".png", initialfile="picture.png",
+                                            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg")])
+        if path:
+            try:
+                self.source_img.convert("RGB").save(path)
+                self.set_status("Picture saved: " + path)
+            except Exception as e:
+                self.set_status(f"Could not save the picture: {e}")
+
     def download_video(self):
         if not self.video_path or not os.path.exists(self.video_path):
             return
@@ -1106,7 +1501,8 @@ class App:
             return
         top = tk.Toplevel(self.root)
         top.title("Drawing video")
-        label = tk.Label(top)
+        top.configure(bg=self.T["BG"])
+        label = tk.Label(top, bg=self.T["BG"])
         label.pack()
         state = {"cap": None, "photo": None, "gen": 0}
 
@@ -1140,7 +1536,7 @@ class App:
                 state["cap"].release()
             top.destroy()
 
-        ttk.Button(top, text="Play again", command=play).pack(pady=6)
+        self._button(top, "Play again", play).pack(pady=6)
         top.protocol("WM_DELETE_WINDOW", close)
         play()
 
