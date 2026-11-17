@@ -39,6 +39,12 @@ FPS = 24
 HOLD_SECONDS = 1.5                                              # the finished picture stays on screen this long in the video
 WHITE, NONE = 254, 255                                          # label values: paper left white / dark outline pixel
 
+# colors and font for the window
+FONT = "Segoe UI"
+BG, HEAD, BORDER = "#f5f3ee", "#1f2937", "#e3ded3"
+TEXT, MUTED = "#1f2937", "#78716c"
+ACCENT, ACCENT_DARK = "#e8590c", "#c94a08"
+
 stop_flag = threading.Event()
 
 
@@ -676,15 +682,17 @@ def mix(color, amount):
 
 
 class App:
-    CW, CH = 620, 600
+    CW, CH = 600, 480
 
     def __init__(self, root):
         from PIL import ImageTk
         self.ImageTk = ImageTk
         self.root = root
         root.title("Drawable")
-        root.geometry("1010x690")
-        root.minsize(900, 640)
+        w = min(1060, max(800, root.winfo_screenwidth() - 40))
+        h = min(700, max(560, root.winfo_screenheight() - 90))
+        root.geometry(f"{w}x{h}")
+        root.minsize(min(w, 940), min(h, 600))
         self.q = queue.Queue()
         self.drawing = None
         self.final_img = None
@@ -699,86 +707,150 @@ class App:
         root.after(80, self.poll)
 
     # ---- layout
+    def _button(self, parent, text, command, kind="plain", **kw):
+        """A flat, clean button. kind: 'primary' (orange), 'plain' (white with a border)."""
+        if kind == "primary":
+            look = dict(bg=ACCENT, fg="white", activebackground=ACCENT_DARK, activeforeground="white",
+                        disabledforeground="#fbe3d6", font=(FONT, 11, "bold"), pady=7)
+        else:
+            look = dict(bg="white", fg=TEXT, activebackground="#f1ede4", activeforeground=TEXT,
+                        disabledforeground="#b5afa3", font=(FONT, 10), pady=4,
+                        highlightthickness=1, highlightbackground=BORDER)
+        look.update(kw)
+        b = tk.Button(parent, text=text, command=command, relief="flat", bd=0, cursor="hand2",
+                      padx=12, **look)
+        if kind == "primary":
+            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg=ACCENT_DARK))
+            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg=ACCENT))
+        else:
+            b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg="#f1ede4"))
+            b.bind("<Leave>", lambda e: b["state"] == "normal" and b.config(bg="white"))
+        return b
+
+    def _card(self, parent, **pack):
+        card = tk.Frame(parent, bg="white", highlightthickness=1, highlightbackground=BORDER)
+        card.pack(**pack)
+        return card
+
     def _build(self):
         root = self.root
+        root.configure(bg=BG)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TCombobox", fieldbackground="white", background="white", padding=4)
+        style.configure("Drawable.Horizontal.TProgressbar", troughcolor="#e8e4da", background=ACCENT,
+                        lightcolor=ACCENT, darkcolor=ACCENT, bordercolor="#e8e4da", thickness=10)
+        root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
-        left = ttk.Frame(root, padding=14)
-        left.grid(row=0, column=0, sticky="ns")
-        right = ttk.Frame(root, padding=(0, 14, 14, 14))
-        right.grid(row=0, column=1, sticky="nsew")
+        root.rowconfigure(1, weight=1)
+
+        # ---- header
+        head = tk.Frame(root, bg=HEAD)
+        head.grid(row=0, column=0, columnspan=2, sticky="ew")
+        tk.Label(head, text="Drawable", bg=HEAD, fg="white", font=(FONT, 18, "bold")).pack(side="left", padx=(18, 10), pady=10)
+        tk.Label(head, text="Describe a picture. Watch it get drawn.", bg=HEAD, fg="#cbd5e1",
+                 font=(FONT, 10)).pack(side="left", pady=10)
+
+        # ---- left: what to draw + options
+        left = tk.Frame(root, bg=BG)
+        left.grid(row=1, column=0, sticky="ns", padx=(14, 8), pady=14)
+        right = tk.Frame(root, bg=BG)
+        right.grid(row=1, column=1, sticky="nsew", padx=(0, 14), pady=14)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
 
-        tk.Label(left, text="Drawable", font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        tk.Label(left, text="Describe a picture. It will draw it for you.", fg="#555").pack(anchor="w", pady=(0, 10))
-
-        ttk.Label(left, text="What should it draw?").pack(anchor="w")
-        self.prompt = tk.Text(left, width=44, height=6, wrap="word", font=("Segoe UI", 10), undo=True)
-        self.prompt.pack(fill="x", pady=(2, 6))
+        ask = self._card(left, fill="x")
+        inner = tk.Frame(ask, bg="white")
+        inner.pack(fill="x", padx=12, pady=12)
+        tk.Label(inner, text="What should it draw?", bg="white", fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w")
+        self.prompt = tk.Text(inner, width=38, height=5, wrap="word", font=(FONT, 10), undo=True, relief="flat", bd=0,
+                              bg="#faf8f3", fg=TEXT, insertbackground=TEXT, padx=8, pady=6,
+                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.prompt.pack(fill="x", pady=(4, 8))
         self.prompt.bind("<Control-Return>", lambda e: (self.on_create(), "break")[1])
-        self.create_btn = tk.Button(left, text="Create & draw", bg="#2e9e57", fg="white", font=("Segoe UI", 11, "bold"),
-                                    command=self.on_create)
-        self.create_btn.pack(fill="x", ipady=4)
-
-        up = ttk.Frame(left)
+        self.create_btn = self._button(inner, "Create & draw", self.on_create, "primary")
+        self.create_btn.pack(fill="x")
+        up = tk.Frame(inner, bg="white")
         up.pack(fill="x", pady=(10, 0))
-        ttk.Button(up, text="Use my own picture", command=self.pick_image).pack(side="left")
-        ttk.Button(up, text="Clear", command=self.clear_image).pack(side="left", padx=6)
-        self.path_label = ttk.Label(left, text="No picture chosen", foreground="#777")
-        self.path_label.pack(anchor="w", pady=(2, 8))
+        self._button(up, "Use my own picture", self.pick_image).pack(side="left")
+        self._button(up, "Clear", self.clear_image).pack(side="left", padx=6)
+        self.path_label = tk.Label(inner, text="No picture chosen", bg="white", fg=MUTED, font=(FONT, 9))
+        self.path_label.pack(anchor="w", pady=(4, 0))
 
-        opts = ttk.LabelFrame(left, text="Options", padding=8)
-        opts.pack(fill="x")
+        optc = self._card(left, fill="x", pady=(10, 0))
+        oi = tk.Frame(optc, bg="white")
+        oi.pack(fill="x", padx=12, pady=10)
+        tk.Label(oi, text="Options", bg="white", fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w")
         self.detail, self.speed = tk.StringVar(value="Normal"), tk.StringVar(value="Normal")
-        row = ttk.Frame(opts)
-        row.pack(fill="x")
-        ttk.Label(row, text="Detail").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(row, textvariable=self.detail, values=list(DETAIL), width=10, state="readonly").grid(row=0, column=1, padx=6)
-        ttk.Label(row, text="Speed").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        row = tk.Frame(oi, bg="white")
+        row.pack(fill="x", pady=(6, 0))
+        tk.Label(row, text="Detail", bg="white", fg=MUTED, font=(FONT, 9)).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(row, textvariable=self.detail, values=list(DETAIL), width=10, state="readonly").grid(row=0, column=1, padx=(6, 14))
+        tk.Label(row, text="Speed", bg="white", fg=MUTED, font=(FONT, 9)).grid(row=0, column=2, sticky="w")
         ttk.Combobox(row, textvariable=self.speed, values=list(SPEED), width=9, state="readonly").grid(row=0, column=3, padx=6)
         self.colors = tk.IntVar(value=20)
-        crow = ttk.Frame(opts)
-        crow.pack(fill="x", pady=4)
-        ttk.Label(crow, text="Colors").pack(side="left")
-        tk.Scale(crow, from_=6, to=32, orient="horizontal", variable=self.colors, length=190).pack(side="left", padx=6)
+        crow = tk.Frame(oi, bg="white")
+        crow.pack(fill="x", pady=(2, 0))
+        tk.Label(crow, text="Colors", bg="white", fg=MUTED, font=(FONT, 9)).pack(side="left")
+        tk.Scale(crow, from_=6, to=32, orient="horizontal", variable=self.colors, length=200, bg="white", fg=TEXT,
+                 troughcolor="#e8e4da", highlightthickness=0, bd=0, activebackground=ACCENT,
+                 font=(FONT, 9)).pack(side="left", padx=8)
         self.o_outline, self.o_fill = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
         self.o_bg, self.o_rec = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
         for text, var in (("Outlines first", self.o_outline), ("Fill in colors", self.o_fill),
-                          ("Draw the background", self.o_bg), ("Record the drawing video", self.o_rec)):
-            ttk.Checkbutton(opts, text=text, variable=var).pack(anchor="w")
+                          ("Draw the background", self.o_bg), ("Record the video", self.o_rec)):
+            tk.Checkbutton(oi, text=text, variable=var, bg="white", fg=TEXT, activebackground="white",
+                           selectcolor="white", font=(FONT, 10), anchor="w", highlightthickness=0).pack(anchor="w")
 
+        prog = self._card(left, fill="x", pady=(10, 0))
+        pi = tk.Frame(prog, bg="white")
+        pi.pack(fill="x", padx=12, pady=10)
         self.status = tk.StringVar(value="Ready. Type what you want drawn, then press Create & draw.")
-        tk.Label(left, textvariable=self.status, wraplength=330, justify="left", fg="#0b57d0").pack(anchor="w", pady=(10, 4))
-        self.bar = ttk.Progressbar(left, mode="determinate", maximum=100)
+        self.status_label = tk.Label(pi, textvariable=self.status, wraplength=300, justify="left", bg="white", fg=TEXT,
+                                     font=(FONT, 10))
+        self.status_label.pack(anchor="w", pady=(0, 6))
+        self.bar = ttk.Progressbar(pi, mode="determinate", maximum=100, style="Drawable.Horizontal.TProgressbar")
         self.bar.pack(fill="x")
-
-        ctl = ttk.Frame(left)
-        ctl.pack(fill="x", pady=8)
-        self.stop_btn = ttk.Button(ctl, text="Stop", command=self.on_stop, state="disabled")
+        ctl = tk.Frame(pi, bg="white")
+        ctl.pack(fill="x", pady=(8, 0))
+        self.stop_btn = self._button(ctl, "Stop", self.on_stop, state="disabled")
         self.stop_btn.pack(side="left")
-        self.skip_btn = ttk.Button(ctl, text="Skip ahead", command=self.on_skip, state="disabled")
+        self.skip_btn = self._button(ctl, "Skip ahead", self.on_skip, state="disabled")
         self.skip_btn.pack(side="left", padx=6)
 
-        self.results = ttk.LabelFrame(left, text="Your drawing is ready", padding=8)
-        self.watch_btn = ttk.Button(self.results, text="Watch the drawing video", command=self.watch_video)
-        self.dl_video_btn = ttk.Button(self.results, text="Download video", command=self.download_video)
-        self.dl_image_btn = ttk.Button(self.results, text="Download drawing", command=self.download_image)
+        # ---- right: colors in use, the drawing paper, and the download buttons
+        self.pal = tk.Canvas(right, height=34, highlightthickness=0, bg=BG)
+        self.pal.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        paper = tk.Frame(right, bg="white", highlightthickness=1, highlightbackground=BORDER)
+        paper.grid(row=1, column=0, sticky="nsew")
+        self.canvas = tk.Canvas(paper, width=self.CW, height=self.CH, bg="#fbfaf7", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self.canvas.create_text(self.CW // 2, self.CH // 2, text="Your drawing will appear here", fill="#a8a29e",
+                                font=(FONT, 14), tags="hint")
 
-        self.pal = tk.Canvas(right, height=34, highlightthickness=0)
-        self.pal.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self.canvas = tk.Canvas(right, width=self.CW, height=self.CH, bg="#f3f3f3", highlightthickness=1,
-                                highlightbackground="#cccccc")
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        self.canvas.create_text(self.CW // 2, self.CH // 2, text="Your drawing will appear here", fill="#999",
-                                font=("Segoe UI", 14), tags="hint")
+        self.results = tk.Frame(right, bg=BG)
+        self.results.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.results.grid_remove()
+        tk.Label(self.results, text="Your drawing is ready", bg=BG, fg=TEXT, font=(FONT, 11, "bold")).pack(side="left", padx=(0, 12))
+        self.dl_image_btn = self._button(self.results, "Download drawing", self.download_image, "primary")
+        self.dl_video_btn = self._button(self.results, "Download video", self.download_video, "primary")
+        self.watch_btn = self._button(self.results, "Watch video", self.watch_video)
 
     # ---- small helpers
     def set_status(self, text):
         self.status.set(text)
+        bad = text.startswith(("Something went wrong", "A problem", "Could not"))
+        try:
+            self.status_label.config(fg="#b91c1c" if bad else TEXT)
+        except Exception:
+            pass
 
     def set_busy(self, busy):
-        self.create_btn.config(state="disabled" if busy else "normal")
+        self.create_btn.config(state="disabled" if busy else "normal", bg="#f1b79a" if busy else ACCENT)
         self.stop_btn.config(state="normal" if busy else "disabled")
         self.skip_btn.config(state="disabled")
 
@@ -807,7 +879,7 @@ class App:
                                       outline="#111111" if i == active else "#bbbbbb", width=3 if i == active else 1)
 
     def clear_results(self):
-        self.results.pack_forget()
+        self.results.grid_remove()
         for b in (self.watch_btn, self.dl_video_btn, self.dl_image_btn):
             b.pack_forget()
         if self.video_path:
@@ -977,11 +1049,11 @@ class App:
         else:
             msg = "Done! Your drawing is ready."
         self.end_run(msg)
-        self.results.pack(fill="x", pady=(4, 0))
+        self.results.grid()
+        self.dl_image_btn.pack(side="left", padx=(0, 6))
         if self.video_path:
-            self.watch_btn.pack(fill="x", pady=2)
-            self.dl_video_btn.pack(fill="x", pady=2)
-        self.dl_image_btn.pack(fill="x", pady=2)
+            self.dl_video_btn.pack(side="left", padx=(0, 6))
+            self.watch_btn.pack(side="left")
 
     def on_ui_error(self, exc, val, tb):
         try:
