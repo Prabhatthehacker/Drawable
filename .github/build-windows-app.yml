@@ -1,7 +1,9 @@
-name: Build Drawable (Windows app)
+name: Build Drawable (single Windows exe)
 
-# Run it by hand: GitHub repo -> Actions tab -> "Build Drawable (Windows app)" -> Run workflow.
-# When it finishes, the app is on the repo's Releases page as Drawable-Windows.zip.
+# Run it by hand: GitHub repo -> Actions tab -> "Build Drawable (single Windows exe)" -> Run workflow.
+# The result is ONE file, Drawable.exe, with everything packed inside (no separate folder).
+# It appears in TWO places: the Artifacts box at the bottom of the run page,
+# and the repo's Releases page (right-hand side of the repo's main page).
 on:
   workflow_dispatch:
   push:
@@ -32,7 +34,8 @@ jobs:
       - name: Build the app
         shell: pwsh
         run: |
-          pyinstaller paint_ai.py --noconfirm --clean --windowed --name Drawable `
+          pyinstaller paint_ai.py --noconfirm --clean --onefile --windowed --name Drawable `
+            --exclude-module matplotlib --exclude-module IPython --exclude-module pytest `
             --collect-submodules diffusers `
             --collect-submodules transformers `
             --collect-data diffusers `
@@ -55,19 +58,22 @@ jobs:
       - name: Check the app starts
         shell: pwsh
         run: |
-          if (-not (Test-Path dist/Drawable/Drawable.exe)) { throw "Drawable.exe was not built" }
-          $p = Start-Process dist/Drawable/Drawable.exe -PassThru
-          Start-Sleep -Seconds 15
+          if (-not (Test-Path dist/Drawable.exe)) { throw "Drawable.exe was not built" }
+          Write-Host ("Drawable.exe size: {0:N0} MB" -f ((Get-Item dist/Drawable.exe).Length / 1MB))
+          $p = Start-Process dist/Drawable.exe -PassThru
+          Start-Sleep -Seconds 60
           if ($p.HasExited) { throw "Drawable.exe closed by itself (exit code $($p.ExitCode))" }
           Stop-Process -Id $p.Id -Force
           Write-Host "Drawable.exe started and stayed open."
 
-      - name: Zip it
-        shell: pwsh
-        run: |
-          Copy-Item README-APP.txt dist/Drawable/README.txt -ErrorAction SilentlyContinue
-          7z a -tzip -mx=5 Drawable-Windows.zip ./dist/Drawable
-          (Get-Item Drawable-Windows.zip).Length / 1MB
+      - name: Upload as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: Drawable-exe
+          path: dist/Drawable.exe
+          compression-level: 0
+          retention-days: 14
 
       - name: Publish to Releases
         shell: pwsh
@@ -75,4 +81,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "build-${{ github.run_number }}" }
-          gh release create $tag Drawable-Windows.zip --title "Drawable $tag" --notes "Unzip, open the Drawable folder, double-click Drawable.exe."
+          gh release create $tag dist/Drawable.exe --title "Drawable $tag" --notes "Download Drawable.exe and double-click it. It is one file. The first start takes a little while."
+          "Your app is on the Releases page of this repo: build tag $tag (file Drawable.exe)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
