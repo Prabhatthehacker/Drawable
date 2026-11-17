@@ -1,0 +1,19 @@
+# Core runtime dependencies for Drawable
+# Torch is installed separately in CI/local setup because the CPU wheel is chosen explicitly.
+opencv-python
+numpy
+Pillow
+
+diffusers
+transformers
+huggingface_hub
+accelerate
+safetensors
+tokenizers
+
+requests
+tqdm
+regex
+PyYAML
+filelock
+packaging
